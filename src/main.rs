@@ -1,12 +1,15 @@
 
 use clap::Parser;
+use crossbeam_channel::{select, tick, unbounded, Receiver, Sender};
 use num_format::{Locale, ToFormattedString};
 use pkcs8::EncodePrivateKey;
 use rayon::prelude::*;
 use rsa::{pkcs1::EncodeRsaPublicKey, RsaPrivateKey};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -45,8 +48,40 @@ fn main() {
 
     println!("Using {} CPU cores for parallel processing", num_cores);
 
-    let total_attempts = AtomicU64::new(0);
-    let start_time = Instant::now();
+    let total_attempts = Arc::new(AtomicU64::new(0));
+    let start_time = Arc::new(Mutex::new(Instant::now()));
+
+    let (stop_sender, stop_receiver): (Sender<()>, Receiver<()>) = unbounded();
+
+    // Spawn a thread to print the summary every 30 seconds
+    let summary_thread = {
+        let total_attempts = Arc::clone(&total_attempts);
+        let start_time = Arc::clone(&start_time);
+        let stop_receiver = stop_receiver.clone();
+
+        thread::spawn(move || {
+            let ticker = tick(Duration::from_secs(30));
+            loop {
+                select! {
+                    recv(ticker) -> _ => {
+                        let elapsed = start_time.lock().unwrap().elapsed().as_secs_f64();
+                        if elapsed > 0.0 {
+                            let attempts_val = total_attempts.load(Ordering::Relaxed);
+                            let keys_per_sec = attempts_val as f64 / elapsed;
+                            println!(
+                                "[Progress] Total attempts: {}, Performance: {:.2} keys/sec",
+                                attempts_val.to_formatted_string(&Locale::en),
+                                keys_per_sec
+                            );
+                        }
+                    },
+                    recv(stop_receiver) -> _ => {
+                        break;
+                    }
+                }
+            }
+        })
+    };
 
     loop {
         let result = (0..num_cores)
@@ -58,7 +93,10 @@ fn main() {
             .find_any(|result| result.is_some());
 
         if let Some(Some((ext_id, pem))) = result {
-            let main_duration = start_time.elapsed().as_secs_f64();
+            stop_sender.send(()).unwrap(); // Signal the summary thread to stop
+            summary_thread.join().unwrap(); // Wait for the summary thread to finish
+
+            let main_duration = start_time.lock().unwrap().elapsed().as_secs_f64();
             let total_attempts_val = total_attempts.load(Ordering::SeqCst);
             let keys_per_second_main = total_attempts_val as f64 / main_duration;
             println!("\n=== Main Run Benchmark Report ===");

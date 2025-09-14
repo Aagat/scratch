@@ -2,22 +2,14 @@
 use clap::Parser;
 use crossbeam_channel::{select, tick, unbounded, Receiver, Sender};
 use num_format::{Locale, ToFormattedString};
-use pkcs8::EncodePrivateKey;
 use rayon::prelude::*;
-use rsa::{pkcs1::EncodeRsaPublicKey, RsaPrivateKey};
+use openssl::pkey::PKey;
+use openssl::rsa::Rsa;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use rand::rngs::StdRng;
-use rand::SeedableRng;
-use std::cell::RefCell;
-
-thread_local! {
-    static LOCAL_RNG: RefCell<StdRng> = RefCell::new(StdRng::from_entropy());
-}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -127,16 +119,13 @@ fn main() {
 }
 
 fn generate_key_and_id(desired_prefix: &str) -> Option<(String, String)> {
-    let bits = 2048;
-    let private_key = LOCAL_RNG.with(|rng_cell| {
-        let mut rng = rng_cell.borrow_mut();
-        RsaPrivateKey::new(&mut *rng, bits).expect("failed to generate a key")
-    });
+    let rsa = Rsa::generate(2048).expect("failed to generate a key");
+    let pkey = PKey::from_rsa(rsa).expect("failed to create PKey");
 
-    let public_key_der = private_key.to_public_key().to_pkcs1_der().unwrap();
+    let public_key_der = pkey.public_key_to_der().expect("failed to DER encode public key");
 
     let mut hasher = Sha256::new();
-    hasher.update(public_key_der.as_bytes());
+    hasher.update(&public_key_der);
     let hash_result = hasher.finalize();
 
     let extension_id: String = hex::encode(&hash_result[..16])
@@ -145,10 +134,8 @@ fn generate_key_and_id(desired_prefix: &str) -> Option<(String, String)> {
         .collect();
 
     if extension_id.starts_with(desired_prefix) {
-        let pem = private_key
-            .to_pkcs8_pem(pkcs8::LineEnding::LF)
-            .unwrap();
-        Some((extension_id, pem.to_string()))
+        let pem = pkey.private_key_to_pem_pkcs8().expect("failed to PEM encode");
+        Some((extension_id, String::from_utf8_lossy(&pem).to_string()))
     } else {
         None
     }

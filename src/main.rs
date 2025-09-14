@@ -87,7 +87,7 @@ fn main() {
         let result = (0..num_cores)
             .into_par_iter()
             .map(|_| {
-                total_attempts.fetch_add(1, Ordering::SeqCst);
+                total_attempts.fetch_add(1, Ordering::Relaxed);
                 generate_key_and_id(desired_prefix)
             })
             .find_any(|result| result.is_some());
@@ -129,9 +129,7 @@ fn generate_key_and_id(desired_prefix: &str) -> Option<(String, String)> {
     hasher.update(public_key_der.as_bytes());
     let hash_result = hasher.finalize();
 
-    let hex_digest = hex::encode(&hash_result[..16]);
-
-    let extension_id: String = hex_digest
+    let extension_id: String = hex::encode(&hash_result[..16])
         .chars()
         .map(|c| MAPPING[c.to_digit(16).unwrap() as usize])
         .collect();

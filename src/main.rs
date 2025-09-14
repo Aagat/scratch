@@ -11,6 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use std::cell::RefCell;
+
+thread_local! {
+    static LOCAL_RNG: RefCell<StdRng> = RefCell::new(StdRng::from_entropy());
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -119,9 +127,11 @@ fn main() {
 }
 
 fn generate_key_and_id(desired_prefix: &str) -> Option<(String, String)> {
-    let mut rng = rand::thread_rng();
     let bits = 2048;
-    let private_key = RsaPrivateKey::new(&mut rng, bits).expect("failed to generate a key");
+    let private_key = LOCAL_RNG.with(|rng_cell| {
+        let mut rng = rng_cell.borrow_mut();
+        RsaPrivateKey::new(&mut *rng, bits).expect("failed to generate a key")
+    });
 
     let public_key_der = private_key.to_public_key().to_pkcs1_der().unwrap();
 

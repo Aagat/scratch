@@ -1,4 +1,3 @@
-
 use clap::Parser;
 use crossbeam_channel::{select, tick, unbounded, Receiver, Sender};
 use num_format::{Locale, ToFormattedString};
@@ -22,6 +21,9 @@ struct Cli {
 
     #[arg(long)]
     benchmark: bool,
+
+    #[arg(long)]
+    single_thread: bool,
 }
 
 const MAPPING: [char; 16] = [
@@ -33,6 +35,7 @@ fn main() {
 
     let desired_prefix = &cli.prefix;
     let num_cores = cli.cores;
+    let single_thread = cli.single_thread;
 
     if cli.benchmark {
         println!("=== Running Single Core Benchmark (100 attempts) ===");
@@ -46,7 +49,11 @@ fn main() {
         println!("===============================");
     }
 
-    println!("Using {} CPU cores for parallel processing", num_cores);
+    if single_thread {
+        println!("Running in single-threaded mode");
+    } else {
+        println!("Using {} CPU cores for parallel processing", num_cores);
+    }
 
     let total_attempts = Arc::new(AtomicU64::new(0));
     let start_time = Arc::new(Mutex::new(Instant::now()));
@@ -83,37 +90,68 @@ fn main() {
         })
     };
 
-    loop {
-        let result = (0..num_cores)
-            .into_par_iter()
-            .map(|_| {
-                total_attempts.fetch_add(1, Ordering::Relaxed);
-                generate_key_and_id(desired_prefix)
-            })
-            .find_any(|result| result.is_some());
+    if single_thread {
+        // Single-threaded mode
+        loop {
+            total_attempts.fetch_add(1, Ordering::Relaxed);
+            if let Some((ext_id, pem)) = generate_key_and_id(desired_prefix) {
+                stop_sender.send(()).unwrap(); // Signal the summary thread to stop
+                summary_thread.join().unwrap(); // Wait for the summary thread to finish
 
-        if let Some(Some((ext_id, pem))) = result {
-            stop_sender.send(()).unwrap(); // Signal the summary thread to stop
-            summary_thread.join().unwrap(); // Wait for the summary thread to finish
+                let main_duration = start_time.lock().unwrap().elapsed().as_secs_f64();
+                let total_attempts_val = total_attempts.load(Ordering::SeqCst);
+                let keys_per_second_main = total_attempts_val as f64 / main_duration;
+                println!("\n=== Main Run Benchmark Report ===");
+                println!(
+                    "Total attempts: {}",
+                    total_attempts_val.to_formatted_string(&Locale::en)
+                );
+                println!("Duration: {:.2} seconds", main_duration);
+                println!("Performance: {:.2} keys/second", keys_per_second_main);
+                println!("Mode: Single-threaded");
+                println!("===============================");
 
-            let main_duration = start_time.lock().unwrap().elapsed().as_secs_f64();
-            let total_attempts_val = total_attempts.load(Ordering::SeqCst);
-            let keys_per_second_main = total_attempts_val as f64 / main_duration;
-            println!("\n=== Main Run Benchmark Report ===");
-            println!(
-                "Total attempts: {}",
-                total_attempts_val.to_formatted_string(&Locale::en)
-            );
-            println!("Duration: {:.2} seconds", main_duration);
-            println!("Performance: {:.2} keys/second", keys_per_second_main);
-            println!("Cores utilized: {}", num_cores);
-            println!("===============================");
+                println!("\nMatch found!");
+                println!("Extension ID: {}", ext_id);
+                std::fs::write("key.pem", pem).expect("Unable to write key to file");
+                println!("Private key saved to 'key.pem'. Keep it secure!");
+                break;
+            }
+        }
+    } else {
+        // Multi-threaded mode (existing code)
+        loop {
+            let result = (0..num_cores)
+                .into_par_iter()
+                .map(|_| {
+                    total_attempts.fetch_add(1, Ordering::Relaxed);
+                    generate_key_and_id(desired_prefix)
+                })
+                .find_any(|result| result.is_some());
 
-            println!("\nMatch found!");
-            println!("Extension ID: {}", ext_id);
-            std::fs::write("key.pem", pem).expect("Unable to write key to file");
-            println!("Private key saved to 'key.pem'. Keep it secure!");
-            break;
+            if let Some(Some((ext_id, pem))) = result {
+                stop_sender.send(()).unwrap(); // Signal the summary thread to stop
+                summary_thread.join().unwrap(); // Wait for the summary thread to finish
+
+                let main_duration = start_time.lock().unwrap().elapsed().as_secs_f64();
+                let total_attempts_val = total_attempts.load(Ordering::SeqCst);
+                let keys_per_second_main = total_attempts_val as f64 / main_duration;
+                println!("\n=== Main Run Benchmark Report ===");
+                println!(
+                    "Total attempts: {}",
+                    total_attempts_val.to_formatted_string(&Locale::en)
+                );
+                println!("Duration: {:.2} seconds", main_duration);
+                println!("Performance: {:.2} keys/second", keys_per_second_main);
+                println!("Cores utilized: {}", num_cores);
+                println!("===============================");
+
+                println!("\nMatch found!");
+                println!("Extension ID: {}", ext_id);
+                std::fs::write("key.pem", pem).expect("Unable to write key to file");
+                println!("Private key saved to 'key.pem'. Keep it secure!");
+                break;
+            }
         }
     }
 }

@@ -3,9 +3,8 @@ use base64::Engine;
 use clap::Parser;
 use crossbeam_channel::{select, tick, unbounded, Receiver, Sender};
 use num_format::{Locale, ToFormattedString};
-use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -55,10 +54,14 @@ fn main() {
 
     if single_thread {
         println!("Running in single-threaded mode");
+        run_single_threaded(desired_prefix);
     } else {
         println!("Using {} CPU cores for parallel processing", num_cores);
+        run_multi_threaded_independent(desired_prefix, num_cores);
     }
+}
 
+fn run_single_threaded(desired_prefix: &str) {
     let total_attempts = Arc::new(AtomicU64::new(0));
     let start_time = Arc::new(Mutex::new(Instant::now()));
 
@@ -94,98 +97,121 @@ fn main() {
         })
     };
 
-    if single_thread {
-        // Single-threaded mode
-        // Create a shared random data chunk for this thread
-        let mut current_chunk = vec![0u8; CHUNK_SIZE];
-        openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
-        let mut shift_position = 0;
+    // Single-threaded mode
+    // Create a shared random data chunk for this thread
+    let mut current_chunk = vec![0u8; CHUNK_SIZE];
+    openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
+    let mut shift_position = 0;
+    
+    loop {
+        total_attempts.fetch_add(1, Ordering::Relaxed);
+        if let Some((ext_id, public_key_data)) = generate_key_and_id_optimized(desired_prefix, &mut current_chunk, &mut shift_position) {
+            stop_sender.send(()).unwrap(); // Signal the summary thread to stop
+            summary_thread.join().unwrap(); // Wait for the summary thread to finish
+
+            let main_duration = start_time.lock().unwrap().elapsed().as_secs_f64();
+            let total_attempts_val = total_attempts.load(Ordering::SeqCst);
+            let keys_per_second_main = total_attempts_val as f64 / main_duration;
+            println!("\n=== Main Run Benchmark Report ===");
+            println!(
+                "Total attempts: {}",
+                total_attempts_val.to_formatted_string(&Locale::en)
+            );
+            println!("Duration: {:.2} seconds", main_duration);
+            println!("Performance: {:.2} keys/second", keys_per_second_main);
+            println!("Mode: Single-threaded");
+            println!("===============================");
+
+            println!("\nMatch found!");
+            println!("Extension ID: {}", ext_id);
+            // Save the public key in DER format
+            std::fs::write("public_key.der", &public_key_data).expect("Unable to write public key to file");
+            println!("Generated public key data saved to 'public_key.der'");
+            
+            // Save the public key in PEM format
+            save_public_key_as_pem(&public_key_data, "public_key.pem");
+            
+            // Print the base64-encoded public key for easy copying
+            let base64_key = base64::engine::general_purpose::STANDARD.encode(&public_key_data);
+            println!("\nPublic key (base64-encoded, for Chrome extension manifest):");
+            println!("{}", base64_key);
+            println!("\nThis key can be directly copied into your Chrome extension's manifest.json file.");
+            break;
+        }
+    }
+}
+
+fn run_multi_threaded_independent(desired_prefix: &str, num_cores: usize) {
+    let start_time = Instant::now();
+    let total_attempts = Arc::new(AtomicU64::new(0));
+    let found = Arc::new(AtomicBool::new(false));
+    let result = Arc::new(Mutex::new(None));
+    
+    let mut handles = vec![];
+    
+    for _ in 0..num_cores {
+        let desired_prefix = desired_prefix.to_string();
+        let total_attempts = Arc::clone(&total_attempts);
+        let found = Arc::clone(&found);
+        let result = Arc::clone(&result);
         
-        loop {
-            total_attempts.fetch_add(1, Ordering::Relaxed);
-            if let Some((ext_id, public_key_data)) = generate_key_and_id_optimized(desired_prefix, &mut current_chunk, &mut shift_position) {
-                stop_sender.send(()).unwrap(); // Signal the summary thread to stop
-                summary_thread.join().unwrap(); // Wait for the summary thread to finish
-
-                let main_duration = start_time.lock().unwrap().elapsed().as_secs_f64();
-                let total_attempts_val = total_attempts.load(Ordering::SeqCst);
-                let keys_per_second_main = total_attempts_val as f64 / main_duration;
-                println!("\n=== Main Run Benchmark Report ===");
-                println!(
-                    "Total attempts: {}",
-                    total_attempts_val.to_formatted_string(&Locale::en)
-                );
-                println!("Duration: {:.2} seconds", main_duration);
-                println!("Performance: {:.2} keys/second", keys_per_second_main);
-                println!("Mode: Single-threaded");
-                println!("===============================");
-
-                println!("\nMatch found!");
-                println!("Extension ID: {}", ext_id);
-                // Save the public key in DER format
-                std::fs::write("public_key.der", &public_key_data).expect("Unable to write public key to file");
-                println!("Generated public key data saved to 'public_key.der'");
-                
-                // Save the public key in PEM format
-                save_public_key_as_pem(&public_key_data, "public_key.pem");
-                
-                // Print the base64-encoded public key for easy copying
-                let base64_key = base64::engine::general_purpose::STANDARD.encode(&public_key_data);
-                println!("\nPublic key (base64-encoded, for Chrome extension manifest):");
-                println!("{}", base64_key);
-                println!("\nThis key can be directly copied into your Chrome extension's manifest.json file.");
-                break;
+        let handle = thread::spawn(move || {
+            // Each thread gets its own random data chunk
+            let mut current_chunk = vec![0u8; CHUNK_SIZE];
+            openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
+            let mut shift_position = 0;
+            
+            while !found.load(Ordering::Relaxed) {
+                total_attempts.fetch_add(1, Ordering::Relaxed);
+                if let Some((ext_id, public_key_data)) = generate_key_and_id_optimized(&desired_prefix, &mut current_chunk, &mut shift_position) {
+                    if !found.swap(true, Ordering::Relaxed) {
+                        // We're the first to find a match
+                        let mut result_lock = result.lock().unwrap();
+                        *result_lock = Some((ext_id, public_key_data));
+                    }
+                    break;
+                }
             }
-        }
-    } else {
-        // Multi-threaded mode
-        loop {
-            let result = (0..num_cores)
-                .into_par_iter()
-                .map(|_| {
-                    total_attempts.fetch_add(1, Ordering::Relaxed);
-                    // Each thread gets its own random data chunk
-                    let mut current_chunk = vec![0u8; CHUNK_SIZE];
-                    openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
-                    let mut shift_position = 0;
-                    generate_key_and_id_optimized(desired_prefix, &mut current_chunk, &mut shift_position)
-                })
-                .find_any(|result| result.is_some());
+        });
+        
+        handles.push(handle);
+    }
+    
+    // Wait for any thread to find a match
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    
+    // Get the result
+    let result_val = result.lock().unwrap().take();
+    if let Some((ext_id, public_key_data)) = result_val {
+        let main_duration = start_time.elapsed().as_secs_f64();
+        let total_attempts_val = total_attempts.load(Ordering::SeqCst);
+        let keys_per_second_main = total_attempts_val as f64 / main_duration;
+        println!("\n=== Main Run Benchmark Report ===");
+        println!(
+            "Total attempts: {}",
+            total_attempts_val.to_formatted_string(&Locale::en)
+        );
+        println!("Duration: {:.2} seconds", main_duration);
+        println!("Performance: {:.2} keys/second", keys_per_second_main);
+        println!("Cores utilized: {}", num_cores);
+        println!("===============================");
 
-            if let Some(Some((ext_id, public_key_data))) = result {
-                stop_sender.send(()).unwrap(); // Signal the summary thread to stop
-                summary_thread.join().unwrap(); // Wait for the summary thread to finish
-
-                let main_duration = start_time.lock().unwrap().elapsed().as_secs_f64();
-                let total_attempts_val = total_attempts.load(Ordering::SeqCst);
-                let keys_per_second_main = total_attempts_val as f64 / main_duration;
-                println!("\n=== Main Run Benchmark Report ===");
-                println!(
-                    "Total attempts: {}",
-                    total_attempts_val.to_formatted_string(&Locale::en)
-                );
-                println!("Duration: {:.2} seconds", main_duration);
-                println!("Performance: {:.2} keys/second", keys_per_second_main);
-                println!("Cores utilized: {}", num_cores);
-                println!("===============================");
-
-                println!("\nMatch found!");
-                println!("Extension ID: {}", ext_id);
-                // Save the public key in DER format
-                std::fs::write("public_key.der", &public_key_data).expect("Unable to write public key to file");
-                println!("Generated public key data saved to 'public_key.der'");
-                
-                // Save the public key in PEM format
-                save_public_key_as_pem(&public_key_data, "public_key.pem");
-                
-                // Print the base64-encoded public key for easy copying
-                let base64_key = base64::engine::general_purpose::STANDARD.encode(&public_key_data);
-                println!("\nPublic key (base64-encoded, for Chrome extension manifest):");
-                println!("{}", base64_key);
-                println!("\nThis key can be directly copied into your Chrome extension's manifest.json file.");
-                break;
-            }
-        }
+        println!("\nMatch found!");
+        println!("Extension ID: {}", ext_id);
+        // Save the public key in DER format
+        std::fs::write("public_key.der", &public_key_data).expect("Unable to write public key to file");
+        println!("Generated public key data saved to 'public_key.der'");
+        
+        // Save the public key in PEM format
+        save_public_key_as_pem(&public_key_data, "public_key.pem");
+        
+        // Print the base64-encoded public key for easy copying
+        let base64_key = base64::engine::general_purpose::STANDARD.encode(&public_key_data);
+        println!("\nPublic key (base64-encoded, for Chrome extension manifest):");
+        println!("{}", base64_key);
+        println!("\nThis key can be directly copied into your Chrome extension's manifest.json file.");
     }
 }
 

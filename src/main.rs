@@ -102,24 +102,27 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
     };
     
     let mut handles = vec![];
+    let desired_prefix = desired_prefix.to_string();
     
     for _ in 0..num_threads {
-        let desired_prefix = desired_prefix.to_string();
+        let desired_prefix = desired_prefix.clone();
         let total_attempts = Arc::clone(&total_attempts);
         let found = Arc::clone(&found);
         let result = Arc::clone(&result);
         
         let handle = thread::spawn(move || {
-            // Each thread gets its own random data chunk
-            let mut current_chunk = vec![0u8; CHUNK_SIZE];
-            openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
+            // Double buffer to avoid cloning in the hot loop
+            let mut double_chunk = vec![0u8; CHUNK_SIZE * 2];
+            openssl::rand::rand_bytes(&mut double_chunk[0..CHUNK_SIZE]).expect("failed to generate random bytes");
+            double_chunk.copy_within(0..CHUNK_SIZE, CHUNK_SIZE);
+            
             let mut shift_position = 0;
             
             while !found.load(Ordering::Relaxed) {
                 total_attempts.fetch_add(1, Ordering::Relaxed);
-                if let Some((ext_id, public_key_data)) = generate_key_and_id_optimized(&desired_prefix, &mut current_chunk, &mut shift_position) {
+                
+                if let Some((ext_id, public_key_data)) = generate_key_and_id_optimized(&desired_prefix, &mut double_chunk, &mut shift_position) {
                     if !found.swap(true, Ordering::Relaxed) {
-                        // We're the first to find a match
                         let mut result_lock = result.lock().unwrap();
                         *result_lock = Some((ext_id, public_key_data));
                     }
@@ -179,28 +182,21 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
     }
 }
 
-fn generate_key_and_id_optimized(desired_prefix: &str, current_chunk: &mut Vec<u8>, shift_position: &mut usize) -> Option<(String, Vec<u8>)> {
-    // If we've exhausted shifts in this chunk, generate a new one
+fn generate_key_and_id_optimized(desired_prefix: &str, double_chunk: &mut [u8], shift_position: &mut usize) -> Option<(String, Vec<u8>)> {
+    // If we've exhausted shifts, generate a new random chunk
     if *shift_position >= SHIFT_WINDOW {
-        openssl::rand::rand_bytes(current_chunk).expect("failed to generate random bytes");
+        openssl::rand::rand_bytes(&mut double_chunk[0..CHUNK_SIZE]).expect("failed to generate random bytes");
+        double_chunk.copy_within(0..CHUNK_SIZE, CHUNK_SIZE);
         *shift_position = 0;
     }
-    
-    // Create a shifted version of the current chunk
-    let mut shifted_chunk = current_chunk.clone();
-    if *shift_position > 0 && *shift_position < shifted_chunk.len() {
-        // Perform a bitwise shift by rotating the bytes
-        shifted_chunk.rotate_left(*shift_position);
-    }
-    
+
+    // Get a slice representing the shifted chunk, no allocation
+    let shifted_slice = &double_chunk[*shift_position..*shift_position + CHUNK_SIZE];
     *shift_position += 1;
-    
-    // Use the shifted chunk as our public key data
-    let public_key_der = shifted_chunk;
-    
+
     // Calculate the Chrome extension ID from the public key
     let mut hasher = Sha256::new();
-    hasher.update(&public_key_der);
+    hasher.update(shifted_slice);
     let hash_result = hasher.finalize();
 
     let extension_id: String = hex::encode(&hash_result[..16])
@@ -209,8 +205,8 @@ fn generate_key_and_id_optimized(desired_prefix: &str, current_chunk: &mut Vec<u
         .collect();
 
     if extension_id.starts_with(desired_prefix) {
-        // For a vanity ID generator, we return the extension ID and the public key data
-        Some((extension_id, public_key_der))
+        // Only allocate and return the Vec when a match is found
+        Some((extension_id, shifted_slice.to_vec()))
     } else {
         None
     }
@@ -219,13 +215,14 @@ fn generate_key_and_id_optimized(desired_prefix: &str, current_chunk: &mut Vec<u
 fn benchmark_keygen(attempts: u32) -> (f64, f64, u32) {
     let start_time = Instant::now();
     // Create a shared random data chunk for benchmarking
-    let mut current_chunk = vec![0u8; CHUNK_SIZE];
-    openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
+    let mut double_chunk = vec![0u8; CHUNK_SIZE * 2];
+    openssl::rand::rand_bytes(&mut double_chunk[0..CHUNK_SIZE]).expect("failed to generate random bytes");
+    double_chunk.copy_within(0..CHUNK_SIZE, CHUNK_SIZE);
     let mut shift_position = 0;
     
     for _ in 0..attempts {
         // We pass a dummy prefix since we don't care about finding a match here
-        generate_key_and_id_optimized("benchmark", &mut current_chunk, &mut shift_position);
+        generate_key_and_id_optimized("benchmark", &mut double_chunk, &mut shift_position);
     }
     let duration = start_time.elapsed().as_secs_f64();
     let keys_per_second = attempts as f64 / duration;

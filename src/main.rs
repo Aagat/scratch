@@ -30,6 +30,10 @@ const MAPPING: [char; 16] = [
     'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
 ];
 
+// Constants for the bit-shifting optimization
+const CHUNK_SIZE: usize = 256; // Generate 256 bytes of random data at a time
+const SHIFT_WINDOW: usize = 32; // Shift by 32 bytes (256 bits) to ensure good variation
+
 fn main() {
     let cli = Cli::parse();
 
@@ -92,9 +96,14 @@ fn main() {
 
     if single_thread {
         // Single-threaded mode
+        // Create a shared random data chunk for this thread
+        let mut current_chunk = vec![0u8; CHUNK_SIZE];
+        openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
+        let mut shift_position = 0;
+        
         loop {
             total_attempts.fetch_add(1, Ordering::Relaxed);
-            if let Some((ext_id, public_key_data)) = generate_key_and_id(desired_prefix) {
+            if let Some((ext_id, public_key_data)) = generate_key_and_id_optimized(desired_prefix, &mut current_chunk, &mut shift_position) {
                 stop_sender.send(()).unwrap(); // Signal the summary thread to stop
                 summary_thread.join().unwrap(); // Wait for the summary thread to finish
 
@@ -129,13 +138,17 @@ fn main() {
             }
         }
     } else {
-        // Multi-threaded mode (existing code)
+        // Multi-threaded mode
         loop {
             let result = (0..num_cores)
                 .into_par_iter()
                 .map(|_| {
                     total_attempts.fetch_add(1, Ordering::Relaxed);
-                    generate_key_and_id(desired_prefix)
+                    // Each thread gets its own random data chunk
+                    let mut current_chunk = vec![0u8; CHUNK_SIZE];
+                    openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
+                    let mut shift_position = 0;
+                    generate_key_and_id_optimized(desired_prefix, &mut current_chunk, &mut shift_position)
                 })
                 .find_any(|result| result.is_some());
 
@@ -176,17 +189,25 @@ fn main() {
     }
 }
 
-fn generate_key_and_id(desired_prefix: &str) -> Option<(String, Vec<u8>)> {
-    // Generate random data to simulate a public key
-    // Using the openssl crate's random generator for cryptographic security
-    let mut rng = vec![0u8; 2048/8];
-    openssl::rand::rand_bytes(&mut rng).expect("failed to generate random bytes");
+fn generate_key_and_id_optimized(desired_prefix: &str, current_chunk: &mut Vec<u8>, shift_position: &mut usize) -> Option<(String, Vec<u8>)> {
+    // If we've exhausted shifts in this chunk, generate a new one
+    if *shift_position >= SHIFT_WINDOW {
+        openssl::rand::rand_bytes(current_chunk).expect("failed to generate random bytes");
+        *shift_position = 0;
+    }
     
-    // Add a basic structure to make it look like a DER-encoded public key
-    // This is a simplified approach - in a real DER structure there would be more specific bytes
-    // but for our purposes of generating a hash, random bytes work fine
-    let public_key_der = rng;
-
+    // Create a shifted version of the current chunk
+    let mut shifted_chunk = current_chunk.clone();
+    if *shift_position > 0 && *shift_position < shifted_chunk.len() {
+        // Perform a bitwise shift by rotating the bytes
+        shifted_chunk.rotate_left(*shift_position);
+    }
+    
+    *shift_position += 1;
+    
+    // Use the shifted chunk as our public key data
+    let public_key_der = shifted_chunk;
+    
     // Calculate the Chrome extension ID from the public key
     let mut hasher = Sha256::new();
     hasher.update(&public_key_der);
@@ -207,9 +228,14 @@ fn generate_key_and_id(desired_prefix: &str) -> Option<(String, Vec<u8>)> {
 
 fn benchmark_keygen(attempts: u32) -> (f64, f64, u32) {
     let start_time = Instant::now();
+    // Create a shared random data chunk for benchmarking
+    let mut current_chunk = vec![0u8; CHUNK_SIZE];
+    openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
+    let mut shift_position = 0;
+    
     for _ in 0..attempts {
         // We pass a dummy prefix since we don't care about finding a match here
-        generate_key_and_id("benchmark");
+        generate_key_and_id_optimized("benchmark", &mut current_chunk, &mut shift_position);
     }
     let duration = start_time.elapsed().as_secs_f64();
     let keys_per_second = attempts as f64 / duration;

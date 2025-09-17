@@ -147,6 +147,39 @@ fn run_multi_threaded_independent(desired_prefix: &str, num_cores: usize) {
     let found = Arc::new(AtomicBool::new(false));
     let result = Arc::new(Mutex::new(None));
     
+    // Channel for stopping the summary thread
+    let (stop_sender, stop_receiver): (Sender<()>, Receiver<()>) = unbounded();
+    
+    // Spawn a thread to print the summary every 30 seconds
+    let summary_thread = {
+        let total_attempts = Arc::clone(&total_attempts);
+        let start_time = start_time.clone();
+        let stop_receiver = stop_receiver.clone();
+        
+        thread::spawn(move || {
+            let ticker = tick(Duration::from_secs(30));
+            loop {
+                select! {
+                    recv(ticker) -> _ => {
+                        let elapsed = start_time.elapsed().as_secs_f64();
+                        if elapsed > 0.0 {
+                            let attempts_val = total_attempts.load(Ordering::Relaxed);
+                            let keys_per_sec = attempts_val as f64 / elapsed;
+                            println!(
+                                "[Progress] Total attempts: {}, Performance: {:.2} keys/sec",
+                                attempts_val.to_formatted_string(&Locale::en),
+                                keys_per_sec
+                            );
+                        }
+                    },
+                    recv(stop_receiver) -> _ => {
+                        break;
+                    }
+                }
+            }
+        })
+    };
+    
     let mut handles = vec![];
     
     for _ in 0..num_cores {
@@ -181,6 +214,10 @@ fn run_multi_threaded_independent(desired_prefix: &str, num_cores: usize) {
     for handle in handles {
         handle.join().unwrap();
     }
+    
+    // Signal the summary thread to stop and wait for it to finish
+    stop_sender.send(()).unwrap();
+    summary_thread.join().unwrap();
     
     // Get the result
     let result_val = result.lock().unwrap().take();

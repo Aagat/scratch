@@ -32,7 +32,7 @@ const MAPPING: [char; 16] = [
 
 // Constants for the bit-shifting optimization
 const CHUNK_SIZE: usize = 256; // Generate 256 bytes of random data at a time
-const SHIFT_WINDOW: usize = 32; // Shift by 32 bytes (256 bits) to ensure good variation
+const SHIFT_WINDOW: usize = 256; // Shift by 1 byte at a time for 256 shifts
 
 fn main() {
     let cli = Cli::parse();

@@ -199,13 +199,36 @@ fn generate_key_and_id_optimized(desired_prefix: &str, double_chunk: &mut [u8], 
     hasher.update(shifted_slice);
     let hash_result = hasher.finalize();
 
-    let extension_id: String = hex::encode(&hash_result[..16])
-        .chars()
-        .map(|c| MAPPING[c.to_digit(16).unwrap() as usize])
-        .collect();
+    let prefix_bytes = desired_prefix.as_bytes();
+    let mut matches = true;
+    for i in 0..prefix_bytes.len() {
+        let hash_byte_index = i / 2;
+        let hash_byte = hash_result[hash_byte_index];
+        
+        let nibble = if i % 2 == 0 {
+            hash_byte >> 4
+        } else {
+            hash_byte & 0x0F
+        };
+        
+        let mapped_char = MAPPING[nibble as usize];
+        
+        if mapped_char as u8 != prefix_bytes[i] {
+            matches = false;
+            break;
+        }
+    }
 
-    if extension_id.starts_with(desired_prefix) {
-        // Only allocate and return the Vec when a match is found
+    if matches {
+        // Now that we have a match, generate the full string.
+        let extension_id: String = hash_result[..16]
+            .iter()
+            .flat_map(|&byte| {
+                let high_nibble = (byte >> 4) as usize;
+                let low_nibble = (byte & 0x0F) as usize;
+                [MAPPING[high_nibble], MAPPING[low_nibble]]
+            })
+            .collect();
         Some((extension_id, shifted_slice.to_vec()))
     } else {
         None

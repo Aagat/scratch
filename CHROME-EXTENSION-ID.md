@@ -87,6 +87,26 @@ if __name__ == "__main__":
    python3 calculate_extension_id.py
    ```
 
+## Using the Vanity ID Generator
+
+When you run the vanity ID generator tool, it will produce several output files:
+
+1. `public_key.der` - The public key in DER (binary) format
+2. `public_key.pem` - The public key in PEM format (base64-encoded DER with headers)
+
+Additionally, the tool will print the base64-encoded public key directly to the console, which you can easily copy and paste into your Chrome extension's `manifest.json` file:
+
+```json
+{
+  "key": "BASE64_ENCODED_PUBLIC_KEY_HERE",
+  "name": "Your Extension",
+  "version": "1.0",
+  "manifest_version": 3
+}
+```
+
+The base64-encoded public key is the value you need for the "key" field in your manifest.json file.
+
 ## Example
 
 For the public key:

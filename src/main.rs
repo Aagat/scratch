@@ -1,3 +1,5 @@
+use base64;
+use base64::Engine;
 use clap::Parser;
 use crossbeam_channel::{select, tick, unbounded, Receiver, Sender};
 use num_format::{Locale, ToFormattedString};
@@ -111,8 +113,18 @@ fn main() {
 
                 println!("\nMatch found!");
                 println!("Extension ID: {}", ext_id);
-                std::fs::write("public_key.der", public_key_data).expect("Unable to write public key to file");
+                // Save the public key in DER format
+                std::fs::write("public_key.der", &public_key_data).expect("Unable to write public key to file");
                 println!("Generated public key data saved to 'public_key.der'");
+                
+                // Save the public key in PEM format
+                save_public_key_as_pem(&public_key_data, "public_key.pem");
+                
+                // Print the base64-encoded public key for easy copying
+                let base64_key = base64::engine::general_purpose::STANDARD.encode(&public_key_data);
+                println!("\nPublic key (base64-encoded, for Chrome extension manifest):");
+                println!("{}", base64_key);
+                println!("\nThis key can be directly copied into your Chrome extension's manifest.json file.");
                 break;
             }
         }
@@ -146,8 +158,18 @@ fn main() {
 
                 println!("\nMatch found!");
                 println!("Extension ID: {}", ext_id);
-                std::fs::write("public_key.der", public_key_data).expect("Unable to write public key to file");
+                // Save the public key in DER format
+                std::fs::write("public_key.der", &public_key_data).expect("Unable to write public key to file");
                 println!("Generated public key data saved to 'public_key.der'");
+                
+                // Save the public key in PEM format
+                save_public_key_as_pem(&public_key_data, "public_key.pem");
+                
+                // Print the base64-encoded public key for easy copying
+                let base64_key = base64::engine::general_purpose::STANDARD.encode(&public_key_data);
+                println!("\nPublic key (base64-encoded, for Chrome extension manifest):");
+                println!("{}", base64_key);
+                println!("\nThis key can be directly copied into your Chrome extension's manifest.json file.");
                 break;
             }
         }
@@ -192,4 +214,28 @@ fn benchmark_keygen(attempts: u32) -> (f64, f64, u32) {
     let duration = start_time.elapsed().as_secs_f64();
     let keys_per_second = attempts as f64 / duration;
     (keys_per_second, duration, attempts)
+}
+
+/// Save the public key in PEM format
+fn save_public_key_as_pem(public_key_data: &[u8], filename: &str) {
+    // Create PEM header and footer
+    let pem_header = "-----BEGIN PUBLIC KEY-----\n";
+    let pem_footer = "\n-----END PUBLIC KEY-----\n";
+    
+    // Base64 encode the public key data with 64-character lines
+    let base64_key = base64::engine::general_purpose::STANDARD.encode(public_key_data);
+    let formatted_base64: String = base64_key
+        .chars()
+        .collect::<Vec<char>>()
+        .chunks(64)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<String>>()
+        .join("\n");
+    
+    // Combine all parts
+    let pem_content = format!("{}{}{}", pem_header, formatted_base64, pem_footer);
+    
+    // Write to file
+    std::fs::write(filename, pem_content).expect("Unable to write public key PEM file");
+    println!("Generated public key saved to '{}'", filename);
 }

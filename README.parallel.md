@@ -28,7 +28,10 @@ This script allows you to run multiple instances of the vanity-id-rust tool in s
 
 The script will create a timestamped directory (e.g., `results_20250101_120000`) containing:
 - `result_*.txt`: Output from each instance
-- `key_*.pem`: Private key files for any matches found
+- `public_key.der`: Public key in DER format for any matches found
+- `public_key.pem`: Public key in PEM format for any matches found
+
+Additionally, the base64-encoded public key will be printed in the output which can be directly copied into your Chrome extension's manifest.json file.
 
 ## How it works
 

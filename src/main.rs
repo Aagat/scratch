@@ -52,96 +52,17 @@ fn main() {
         println!("===============================");
     }
 
-    if single_thread {
+    let thread_count = if single_thread { 1 } else { num_cores };
+    if thread_count == 1 {
         println!("Running in single-threaded mode");
-        run_single_threaded(desired_prefix);
     } else {
-        println!("Using {} CPU cores for parallel processing", num_cores);
-        run_multi_threaded_independent(desired_prefix, num_cores);
+        println!("Using {} CPU cores for parallel processing", thread_count);
     }
-}
-
-fn run_single_threaded(desired_prefix: &str) {
-    let total_attempts = Arc::new(AtomicU64::new(0));
-    let start_time = Arc::new(Mutex::new(Instant::now()));
-
-    let (stop_sender, stop_receiver): (Sender<()>, Receiver<()>) = unbounded();
-
-    // Spawn a thread to print the summary every 30 seconds
-    let summary_thread = {
-        let total_attempts = Arc::clone(&total_attempts);
-        let start_time = Arc::clone(&start_time);
-        let stop_receiver = stop_receiver.clone();
-
-        thread::spawn(move || {
-            let ticker = tick(Duration::from_secs(30));
-            loop {
-                select! {
-                    recv(ticker) -> _ => {
-                        let elapsed = start_time.lock().unwrap().elapsed().as_secs_f64();
-                        if elapsed > 0.0 {
-                            let attempts_val = total_attempts.load(Ordering::Relaxed);
-                            let keys_per_sec = attempts_val as f64 / elapsed;
-                            println!(
-                                "[Progress] Total attempts: {}, Performance: {:.2} keys/sec",
-                                attempts_val.to_formatted_string(&Locale::en),
-                                keys_per_sec
-                            );
-                        }
-                    },
-                    recv(stop_receiver) -> _ => {
-                        break;
-                    }
-                }
-            }
-        })
-    };
-
-    // Single-threaded mode
-    // Create a shared random data chunk for this thread
-    let mut current_chunk = vec![0u8; CHUNK_SIZE];
-    openssl::rand::rand_bytes(&mut current_chunk).expect("failed to generate random bytes");
-    let mut shift_position = 0;
     
-    loop {
-        total_attempts.fetch_add(1, Ordering::Relaxed);
-        if let Some((ext_id, public_key_data)) = generate_key_and_id_optimized(desired_prefix, &mut current_chunk, &mut shift_position) {
-            stop_sender.send(()).unwrap(); // Signal the summary thread to stop
-            summary_thread.join().unwrap(); // Wait for the summary thread to finish
-
-            let main_duration = start_time.lock().unwrap().elapsed().as_secs_f64();
-            let total_attempts_val = total_attempts.load(Ordering::SeqCst);
-            let keys_per_second_main = total_attempts_val as f64 / main_duration;
-            println!("\n=== Main Run Benchmark Report ===");
-            println!(
-                "Total attempts: {}",
-                total_attempts_val.to_formatted_string(&Locale::en)
-            );
-            println!("Duration: {:.2} seconds", main_duration);
-            println!("Performance: {:.2} keys/second", keys_per_second_main);
-            println!("Mode: Single-threaded");
-            println!("===============================");
-
-            println!("\nMatch found!");
-            println!("Extension ID: {}", ext_id);
-            // Save the public key in DER format
-            std::fs::write("public_key.der", &public_key_data).expect("Unable to write public key to file");
-            println!("Generated public key data saved to 'public_key.der'");
-            
-            // Save the public key in PEM format
-            save_public_key_as_pem(&public_key_data, "public_key.pem");
-            
-            // Print the base64-encoded public key for easy copying
-            let base64_key = base64::engine::general_purpose::STANDARD.encode(&public_key_data);
-            println!("\nPublic key (base64-encoded, for Chrome extension manifest):");
-            println!("{}", base64_key);
-            println!("\nThis key can be directly copied into your Chrome extension's manifest.json file.");
-            break;
-        }
-    }
+    run_vanity_id_generator(desired_prefix, thread_count);
 }
 
-fn run_multi_threaded_independent(desired_prefix: &str, num_cores: usize) {
+fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
     let start_time = Instant::now();
     let total_attempts = Arc::new(AtomicU64::new(0));
     let found = Arc::new(AtomicBool::new(false));
@@ -182,7 +103,7 @@ fn run_multi_threaded_independent(desired_prefix: &str, num_cores: usize) {
     
     let mut handles = vec![];
     
-    for _ in 0..num_cores {
+    for _ in 0..num_threads {
         let desired_prefix = desired_prefix.to_string();
         let total_attempts = Arc::clone(&total_attempts);
         let found = Arc::clone(&found);
@@ -230,9 +151,15 @@ fn run_multi_threaded_independent(desired_prefix: &str, num_cores: usize) {
             "Total attempts: {}",
             total_attempts_val.to_formatted_string(&Locale::en)
         );
-        println!("Duration: {:.2} seconds", main_duration);
-        println!("Performance: {:.2} keys/second", keys_per_second_main);
-        println!("Cores utilized: {}", num_cores);
+        if num_threads == 1 {
+            println!("Duration: {:.2} seconds", main_duration);
+            println!("Performance: {:.2} keys/second", keys_per_second_main);
+            println!("Mode: Single-threaded");
+        } else {
+            println!("Duration: {:.2} seconds", main_duration);
+            println!("Performance: {:.2} keys/second", keys_per_second_main);
+            println!("Cores utilized: {}", num_threads);
+        }
         println!("===============================");
 
         println!("\nMatch found!");

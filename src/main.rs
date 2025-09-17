@@ -48,7 +48,7 @@ fn main() {
             attempts.to_formatted_string(&Locale::en)
         );
         println!("Duration: {:.2} seconds", duration);
-        println!("Performance: {:.2} keys/second", keys_per_sec);
+        println!("Performance: {} keys/second", (keys_per_sec as u64).to_formatted_string(&Locale::en));
         println!("===============================");
     }
 
@@ -87,9 +87,9 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
                             let attempts_val = total_attempts.load(Ordering::Relaxed);
                             let keys_per_sec = attempts_val as f64 / elapsed;
                             println!(
-                                "[Progress] Total attempts: {}, Performance: {:.2} keys/sec",
+                                "[Progress] Total attempts: {}, Performance: {} keys/sec",
                                 attempts_val.to_formatted_string(&Locale::en),
-                                keys_per_sec
+                                (keys_per_sec as u64).to_formatted_string(&Locale::en)
                             );
                         }
                     },
@@ -153,11 +153,11 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
         );
         if num_threads == 1 {
             println!("Duration: {:.2} seconds", main_duration);
-            println!("Performance: {:.2} keys/second", keys_per_second_main);
+            println!("Performance: {} keys/second", (keys_per_second_main as u64).to_formatted_string(&Locale::en));
             println!("Mode: Single-threaded");
         } else {
             println!("Duration: {:.2} seconds", main_duration);
-            println!("Performance: {:.2} keys/second", keys_per_second_main);
+            println!("Performance: {} keys/second", (keys_per_second_main as u64).to_formatted_string(&Locale::en));
             println!("Cores utilized: {}", num_threads);
         }
         println!("===============================");

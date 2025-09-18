@@ -3,7 +3,7 @@ use base64::Engine;
 use clap::Parser;
 use num_format::{Locale, ToFormattedString};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -62,62 +62,86 @@ fn main() {
 
 fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
     let start_time = Instant::now();
-    let total_attempts = Arc::new(AtomicU64::new(0));
     let found = Arc::new(AtomicBool::new(false));
     let result = Arc::new(Mutex::new(None));
     let last_progress_time = Arc::new(Mutex::new(Instant::now()));
+
+    // Shared progress tracking - each thread will report its attempts
+    let thread_attempts = Arc::new(Mutex::new(vec![0u64; num_threads]));
+
+    // Calculate counter ranges for each thread to avoid overlap
+    // Each thread gets a large range to work with independently
+    const THREAD_RANGE_SIZE: u64 = u64::MAX / 1024; // Large range per thread
 
     // Spawn worker threads
     let handles: Vec<_> = (0..num_threads)
         .map(|thread_id| {
             let prefix = desired_prefix.to_string();
-            let attempts = Arc::clone(&total_attempts);
             let found = Arc::clone(&found);
             let result = Arc::clone(&result);
             let start_time = start_time.clone();
             let last_progress_time = Arc::clone(&last_progress_time);
+            let thread_attempts = Arc::clone(&thread_attempts);
 
             thread::spawn(move || {
-                const BATCH_SIZE: u64 = 1000; // Process in batches to reduce atomic operations
-                let mut local_counter = 0u64;
-                let mut batch_start = 0u64;
+                // Each thread calculates its own starting counter to avoid overlap
+                let thread_start_counter = (thread_id as u64) * THREAD_RANGE_SIZE;
+                let mut local_counter = thread_start_counter;
+                let mut local_attempts = 0u64;
+                const PROGRESS_REPORT_INTERVAL: u64 = 10000; // Report progress every 10k attempts
 
                 while !found.load(Ordering::Relaxed) {
-                    // Get a batch of work
-                    if local_counter == 0 {
-                        batch_start = attempts.fetch_add(BATCH_SIZE, Ordering::Relaxed);
-                        local_counter = BATCH_SIZE;
-                    }
-
-                    let counter = batch_start + (BATCH_SIZE - local_counter);
-                    local_counter -= 1;
-
-                    if let Some((ext_id, key_data)) = try_generate_match_optimized(&prefix, counter)
+                    if let Some((ext_id, key_data)) =
+                        try_generate_match_optimized(&prefix, local_counter)
                     {
                         if !found.swap(true, Ordering::Relaxed) {
-                            *result.lock().unwrap() = Some((ext_id, key_data));
+                            *result.lock().unwrap() = Some((ext_id, key_data, local_attempts + 1));
                         }
                         break;
                     }
 
-                    // Only thread 0 prints progress every second
-                    if thread_id == 0 {
-                        let now = Instant::now();
-                        let mut last_time = last_progress_time.lock().unwrap();
-                        if now.duration_since(*last_time).as_secs() >= 1 {
-                            *last_time = now;
-                            let total = attempts.load(Ordering::Relaxed);
-                            let elapsed = start_time.elapsed().as_secs_f64();
-                            if elapsed > 0.0 {
-                                let rate = total as f64 / elapsed;
-                                println!(
-                                    "Progress: {} attempts, {} keys/sec",
-                                    total.to_formatted_string(&Locale::en),
-                                    (rate as u64).to_formatted_string(&Locale::en)
-                                );
+                    local_counter += 1;
+                    local_attempts += 1;
+
+                    // Periodically update shared progress and print status (only thread 0)
+                    if local_attempts % PROGRESS_REPORT_INTERVAL == 0 {
+                        // Update this thread's attempt count
+                        {
+                            let mut attempts = thread_attempts.lock().unwrap();
+                            attempts[thread_id] = local_attempts;
+                        }
+
+                        // Only thread 0 prints progress every second
+                        if thread_id == 0 {
+                            let now = Instant::now();
+                            let mut last_time = last_progress_time.lock().unwrap();
+                            if now.duration_since(*last_time).as_secs() >= 1 {
+                                *last_time = now;
+
+                                // Calculate total attempts across all threads
+                                let total = {
+                                    let attempts = thread_attempts.lock().unwrap();
+                                    attempts.iter().sum::<u64>()
+                                };
+
+                                let elapsed = start_time.elapsed().as_secs_f64();
+                                if elapsed > 0.0 {
+                                    let rate = total as f64 / elapsed;
+                                    println!(
+                                        "Progress: {} attempts, {} keys/sec",
+                                        total.to_formatted_string(&Locale::en),
+                                        (rate as u64).to_formatted_string(&Locale::en)
+                                    );
+                                }
                             }
                         }
                     }
+                }
+
+                // Final update of this thread's attempts
+                {
+                    let mut attempts = thread_attempts.lock().unwrap();
+                    attempts[thread_id] = local_attempts;
                 }
             })
         })
@@ -130,9 +154,15 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
 
     // Output results
     let result_data = result.lock().unwrap().take();
-    if let Some((ext_id, key_data)) = result_data {
+    if let Some((ext_id, key_data, _winning_thread_attempts)) = result_data {
         let duration = start_time.elapsed().as_secs_f64();
-        let total = total_attempts.load(Ordering::SeqCst);
+
+        // Calculate total attempts across all threads
+        let total = {
+            let attempts = thread_attempts.lock().unwrap();
+            attempts.iter().sum::<u64>()
+        };
+
         let rate = total as f64 / duration;
 
         println!("\n🎉 Match found!");

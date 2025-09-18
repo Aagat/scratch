@@ -51,10 +51,22 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
             let start_time = start_time.clone();
 
             thread::spawn(move || {
-                while !found.load(Ordering::Relaxed) {
-                    let counter = attempts.fetch_add(1, Ordering::Relaxed);
+                const BATCH_SIZE: u64 = 1000; // Process in batches to reduce atomic operations
+                let mut local_counter = 0u64;
+                let mut batch_start = 0u64;
 
-                    if let Some((ext_id, key_data)) = try_generate_match(&prefix, counter) {
+                while !found.load(Ordering::Relaxed) {
+                    // Get a batch of work
+                    if local_counter == 0 {
+                        batch_start = attempts.fetch_add(BATCH_SIZE, Ordering::Relaxed);
+                        local_counter = BATCH_SIZE;
+                    }
+
+                    let counter = batch_start + (BATCH_SIZE - local_counter);
+                    local_counter -= 1;
+
+                    if let Some((ext_id, key_data)) = try_generate_match_optimized(&prefix, counter)
+                    {
                         if !found.swap(true, Ordering::Relaxed) {
                             *result.lock().unwrap() = Some((ext_id, key_data));
                         }
@@ -110,15 +122,15 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
     }
 }
 
-fn try_generate_match(desired_prefix: &str, counter: u64) -> Option<(String, [u8; 32])> {
+fn try_generate_match_optimized(desired_prefix: &str, counter: u64) -> Option<(String, [u8; 32])> {
     // Generate key data from counter
     let key_data = generate_key_data(counter);
 
     // Hash the key data
     let hash = Sha256::digest(&key_data);
 
-    // Check if hash matches desired prefix
-    if hash_matches_prefix(&hash, desired_prefix) {
+    // Optimized hash matching with early exit
+    if hash_matches_prefix_optimized(&hash, desired_prefix) {
         let extension_id = hash_to_extension_id(&hash);
         Some((extension_id, key_data))
     } else {
@@ -141,19 +153,39 @@ fn generate_key_data(counter: u64) -> [u8; 32] {
     data
 }
 
-fn hash_matches_prefix(hash: &[u8], prefix: &str) -> bool {
+fn hash_matches_prefix_optimized(hash: &[u8], prefix: &str) -> bool {
     let prefix_bytes = prefix.as_bytes();
+    let prefix_len = prefix_bytes.len();
 
-    for (i, &expected_char) in prefix_bytes.iter().enumerate() {
-        let hash_byte = hash[i / 2];
-        let nibble = if i % 2 == 0 {
-            hash_byte >> 4
-        } else {
-            hash_byte & 0x0F
-        };
-        let actual_char = MAPPING[nibble as usize];
+    // Early exit for empty prefix
+    if prefix_len == 0 {
+        return true;
+    }
 
-        if actual_char as u8 != expected_char {
+    // Process pairs of characters (full bytes) first for better performance
+    let full_bytes = prefix_len / 2;
+    for byte_idx in 0..full_bytes {
+        let hash_byte = hash[byte_idx];
+        let expected_high = prefix_bytes[byte_idx * 2];
+        let expected_low = prefix_bytes[byte_idx * 2 + 1];
+
+        // Convert hash byte to characters
+        let actual_high = MAPPING[(hash_byte >> 4) as usize] as u8;
+        let actual_low = MAPPING[(hash_byte & 0x0F) as usize] as u8;
+
+        // Early exit on first mismatch
+        if actual_high != expected_high || actual_low != expected_low {
+            return false;
+        }
+    }
+
+    // Handle odd-length prefix (remaining single character)
+    if prefix_len % 2 == 1 {
+        let hash_byte = hash[full_bytes];
+        let expected_char = prefix_bytes[prefix_len - 1];
+        let actual_char = MAPPING[(hash_byte >> 4) as usize] as u8;
+
+        if actual_char != expected_char {
             return false;
         }
     }

@@ -8,6 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+mod gpu;
+#[cfg(target_os = "macos")]
+use gpu::GpuVanityGenerator;
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -19,6 +24,18 @@ struct Cli {
 
     #[arg(long)]
     single_thread: bool,
+
+    #[cfg(target_os = "macos")]
+    #[arg(long, help = "Use GPU acceleration (Apple Silicon only)")]
+    gpu: bool,
+
+    #[cfg(target_os = "macos")]
+    #[arg(
+        long,
+        default_value_t = 1_000_000,
+        help = "GPU batch size for each compute dispatch"
+    )]
+    gpu_batch_size: u64,
 }
 
 const MAPPING: [char; 16] = [
@@ -27,8 +44,16 @@ const MAPPING: [char; 16] = [
 
 fn main() {
     let cli = Cli::parse();
-    let thread_count = if cli.single_thread { 1 } else { cli.cores };
 
+    #[cfg(target_os = "macos")]
+    if cli.gpu {
+        println!("Searching for extension ID with prefix: {}", cli.prefix);
+        println!("Using GPU acceleration (Apple Silicon)");
+        run_gpu_vanity_id_generator(&cli.prefix, cli.gpu_batch_size);
+        return;
+    }
+
+    let thread_count = if cli.single_thread { 1 } else { cli.cores };
     println!("Searching for extension ID with prefix: {}", cli.prefix);
     println!("Using {} thread(s)", thread_count);
 
@@ -40,6 +65,7 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
     let total_attempts = Arc::new(AtomicU64::new(0));
     let found = Arc::new(AtomicBool::new(false));
     let result = Arc::new(Mutex::new(None));
+    let last_progress_time = Arc::new(Mutex::new(Instant::now()));
 
     // Spawn worker threads
     let handles: Vec<_> = (0..num_threads)
@@ -49,6 +75,7 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
             let found = Arc::clone(&found);
             let result = Arc::clone(&result);
             let start_time = start_time.clone();
+            let last_progress_time = Arc::clone(&last_progress_time);
 
             thread::spawn(move || {
                 const BATCH_SIZE: u64 = 1000; // Process in batches to reduce atomic operations
@@ -73,17 +100,22 @@ fn run_vanity_id_generator(desired_prefix: &str, num_threads: usize) {
                         break;
                     }
 
-                    // Only thread 0 prints progress every 10M attempts
-                    if thread_id == 0 && counter % 10_000_000 == 0 {
-                        let total = attempts.load(Ordering::Relaxed);
-                        let elapsed = start_time.elapsed().as_secs_f64();
-                        if elapsed > 0.0 {
-                            let rate = total as f64 / elapsed;
-                            println!(
-                                "Progress: {} attempts, {} keys/sec",
-                                total.to_formatted_string(&Locale::en),
-                                (rate as u64).to_formatted_string(&Locale::en)
-                            );
+                    // Only thread 0 prints progress every second
+                    if thread_id == 0 {
+                        let now = Instant::now();
+                        let mut last_time = last_progress_time.lock().unwrap();
+                        if now.duration_since(*last_time).as_secs() >= 1 {
+                            *last_time = now;
+                            let total = attempts.load(Ordering::Relaxed);
+                            let elapsed = start_time.elapsed().as_secs_f64();
+                            if elapsed > 0.0 {
+                                let rate = total as f64 / elapsed;
+                                println!(
+                                    "Progress: {} attempts, {} keys/sec",
+                                    total.to_formatted_string(&Locale::en),
+                                    (rate as u64).to_formatted_string(&Locale::en)
+                                );
+                            }
                         }
                     }
                 }
@@ -202,6 +234,96 @@ fn hash_to_extension_id(hash: &[u8]) -> String {
             [high, low]
         })
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn run_gpu_vanity_id_generator(desired_prefix: &str, batch_size: u64) {
+    let start_time = Instant::now();
+    let mut total_attempts = 0u64;
+    let mut last_progress_time = Instant::now();
+
+    // Initialize GPU
+    let gpu = match GpuVanityGenerator::new() {
+        Ok(gpu) => {
+            println!("GPU Device: {}", gpu.get_device_name());
+            println!("Max threads per group: {}", gpu.get_max_threads_per_group());
+            println!(
+                "Batch size: {}",
+                batch_size.to_formatted_string(&Locale::en)
+            );
+            gpu
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize GPU: {}", e);
+            eprintln!("Falling back to CPU implementation...");
+            run_vanity_id_generator(desired_prefix, num_cpus::get());
+            return;
+        }
+    };
+
+    let mut counter = 0u64;
+    loop {
+        match gpu.search_vanity_id(desired_prefix, counter, batch_size) {
+            Ok(Some((found_counter, key_data))) => {
+                // Found a match!
+                total_attempts += found_counter - counter + 1;
+
+                let duration = start_time.elapsed().as_secs_f64();
+                let rate = total_attempts as f64 / duration;
+
+                // Generate extension ID for display
+                let hash = Sha256::digest(&key_data);
+                let extension_id = hash_to_extension_id(&hash);
+
+                println!("\n🎉 Match found!");
+                println!("Extension ID: {}", extension_id);
+                println!(
+                    "Total attempts: {}",
+                    total_attempts.to_formatted_string(&Locale::en)
+                );
+                println!("Duration: {:.2} seconds", duration);
+                println!(
+                    "Rate: {} keys/second",
+                    (rate as u64).to_formatted_string(&Locale::en)
+                );
+
+                // Save files
+                save_key_files(&key_data);
+
+                // Print base64 for manifest
+                let base64_key = base64::engine::general_purpose::STANDARD.encode(&key_data);
+                println!("\nPublic key for manifest.json:");
+                println!("{}", base64_key);
+                break;
+            }
+            Ok(None) => {
+                // No match in this batch, continue
+                total_attempts += batch_size;
+                counter += batch_size;
+
+                // Print progress every second
+                let now = Instant::now();
+                if now.duration_since(last_progress_time).as_secs() >= 1 {
+                    last_progress_time = now;
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    if elapsed > 0.0 {
+                        let rate = total_attempts as f64 / elapsed;
+                        println!(
+                            "Progress: {} attempts, {} keys/sec",
+                            total_attempts.to_formatted_string(&Locale::en),
+                            (rate as u64).to_formatted_string(&Locale::en)
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("GPU error: {}", e);
+                eprintln!("Falling back to CPU implementation...");
+                run_vanity_id_generator(desired_prefix, num_cpus::get());
+                break;
+            }
+        }
+    }
 }
 
 fn save_key_files(key_data: &[u8]) {

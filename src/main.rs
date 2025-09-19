@@ -13,9 +13,9 @@ mod gpu;
 #[cfg(target_os = "macos")]
 use gpu::GpuVanityGenerator;
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
 mod cuda_gpu;
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
 use cuda_gpu::CudaVanityGenerator;
 
 #[derive(Parser)]
@@ -68,8 +68,15 @@ fn main() {
         };
         #[cfg(target_os = "macos")]
         run_hybrid_vanity_id_generator(&cli.prefix, cpu_threads, cli.gpu_batch_size);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
         run_cuda_hybrid_vanity_id_generator(&cli.prefix, cpu_threads, cli.gpu_batch_size);
+        #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+        {
+            eprintln!(
+                "GPU acceleration not available on this platform. Please build with CUDA support."
+            );
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -80,10 +87,17 @@ fn main() {
             println!("Using GPU acceleration (Metal - Apple Silicon)");
             run_gpu_vanity_id_generator(&cli.prefix, cli.gpu_batch_size);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(feature = "cuda", not(target_os = "macos")))]
         {
             println!("Using GPU acceleration (CUDA - NVIDIA)");
-            run_cuda_gpu_vanity_id_generator(&cli.prefix, cli.gpu_batch_size);
+            run_cuda_vanity_id_generator(&cli.prefix, cli.gpu_batch_size);
+        }
+        #[cfg(not(any(target_os = "macos", feature = "cuda")))]
+        {
+            eprintln!(
+                "GPU acceleration not available on this platform. Please build with CUDA support."
+            );
+            std::process::exit(1);
         }
         return;
     }
@@ -614,7 +628,7 @@ fn run_gpu_vanity_id_generator(desired_prefix: &str, batch_size: u64) {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
 fn run_cuda_hybrid_vanity_id_generator(
     desired_prefix: &str,
     num_cpu_threads: usize,
@@ -835,7 +849,7 @@ fn run_cuda_hybrid_vanity_id_generator(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(target_os = "macos")))]
 fn run_cuda_vanity_id_generator(desired_prefix: &str, batch_size: u64) {
     let start_time = Instant::now();
     let mut total_attempts = 0u64;

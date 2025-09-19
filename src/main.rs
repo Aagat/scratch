@@ -13,6 +13,11 @@ mod gpu;
 #[cfg(target_os = "macos")]
 use gpu::GpuVanityGenerator;
 
+#[cfg(feature = "cuda")]
+mod cuda_gpu;
+#[cfg(feature = "cuda")]
+use cuda_gpu::CudaVanityGenerator;
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -25,18 +30,18 @@ struct Cli {
     #[arg(long)]
     single_thread: bool,
 
-    #[cfg(target_os = "macos")]
-    #[arg(long, help = "Use GPU acceleration (Apple Silicon only)")]
+    #[arg(
+        long,
+        help = "Use GPU acceleration (Metal on macOS, CUDA on Windows/Linux)"
+    )]
     gpu: bool,
 
-    #[cfg(target_os = "macos")]
     #[arg(
         long,
         help = "Use both GPU and CPU simultaneously for maximum performance"
     )]
     hybrid: bool,
 
-    #[cfg(target_os = "macos")]
     #[arg(
         long,
         default_value_t = 1_000_000,
@@ -52,7 +57,6 @@ const MAPPING: [char; 16] = [
 fn main() {
     let cli = Cli::parse();
 
-    #[cfg(target_os = "macos")]
     if cli.hybrid {
         println!("Searching for extension ID with prefix: {}", cli.prefix);
         println!("Using hybrid mode: GPU + CPU simultaneously");
@@ -62,15 +66,25 @@ fn main() {
         } else {
             std::cmp::max(1, cli.cores / 4)
         };
+        #[cfg(target_os = "macos")]
         run_hybrid_vanity_id_generator(&cli.prefix, cpu_threads, cli.gpu_batch_size);
+        #[cfg(not(target_os = "macos"))]
+        run_cuda_hybrid_vanity_id_generator(&cli.prefix, cpu_threads, cli.gpu_batch_size);
         return;
     }
 
-    #[cfg(target_os = "macos")]
     if cli.gpu {
         println!("Searching for extension ID with prefix: {}", cli.prefix);
-        println!("Using GPU acceleration (Apple Silicon)");
-        run_gpu_vanity_id_generator(&cli.prefix, cli.gpu_batch_size);
+        #[cfg(target_os = "macos")]
+        {
+            println!("Using GPU acceleration (Metal - Apple Silicon)");
+            run_gpu_vanity_id_generator(&cli.prefix, cli.gpu_batch_size);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            println!("Using GPU acceleration (CUDA - NVIDIA)");
+            run_cuda_gpu_vanity_id_generator(&cli.prefix, cli.gpu_batch_size);
+        }
         return;
     }
 
@@ -312,9 +326,7 @@ fn run_hybrid_vanity_id_generator(
         }
         Err(e) => {
             eprintln!("Failed to initialize GPU: {}", e);
-            eprintln!("Falling back to CPU-only implementation...");
-            run_vanity_id_generator(desired_prefix, num_cpu_threads);
-            return;
+            std::process::exit(1);
         }
     };
 
@@ -529,9 +541,7 @@ fn run_gpu_vanity_id_generator(desired_prefix: &str, batch_size: u64) {
         }
         Err(e) => {
             eprintln!("Failed to initialize GPU: {}", e);
-            eprintln!("Falling back to CPU implementation...");
-            run_vanity_id_generator(desired_prefix, num_cpus::get());
-            return;
+            std::process::exit(1);
         }
     };
 
@@ -598,9 +608,320 @@ fn run_gpu_vanity_id_generator(desired_prefix: &str, batch_size: u64) {
             }
             Err(e) => {
                 eprintln!("GPU error: {}", e);
-                eprintln!("Falling back to CPU implementation...");
-                run_vanity_id_generator(desired_prefix, num_cpus::get());
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn run_cuda_hybrid_vanity_id_generator(
+    desired_prefix: &str,
+    num_cpu_threads: usize,
+    gpu_batch_size: u64,
+) {
+    let start_time = Instant::now();
+    let found = Arc::new(AtomicBool::new(false));
+    let result = Arc::new(Mutex::new(None));
+    let last_progress_time = Arc::new(Mutex::new(Instant::now()));
+
+    // Initialize CUDA GPU
+    let gpu = match CudaVanityGenerator::new() {
+        Ok(gpu) => {
+            println!("CUDA GPU Device: {}", gpu.get_device_name());
+            println!("Max threads per block: {}", gpu.get_max_threads_per_block());
+            println!(
+                "CUDA GPU batch size: {}",
+                gpu_batch_size.to_formatted_string(&Locale::en)
+            );
+            println!("CPU threads: {}", num_cpu_threads);
+            Some(gpu)
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize CUDA GPU: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Shared progress tracking for both GPU and CPU
+    let gpu_attempts = Arc::new(Mutex::new(0u64));
+    let cpu_attempts = Arc::new(Mutex::new(vec![0u64; num_cpu_threads]));
+
+    // Counter range allocation:
+    // GPU gets the first half of the counter space (0 to u64::MAX/2)
+    // CPU threads get the second half (u64::MAX/2 to u64::MAX)
+    const GPU_RANGE_START: u64 = 0;
+    const CPU_RANGE_START: u64 = u64::MAX / 2;
+    const CPU_THREAD_RANGE_SIZE: u64 = (u64::MAX / 2) / 1024; // CPU threads share second half
+
+    // Spawn GPU thread
+    let gpu_handle = {
+        let prefix = desired_prefix.to_string();
+        let found = Arc::clone(&found);
+        let result = Arc::clone(&result);
+        let gpu_attempts = Arc::clone(&gpu_attempts);
+        let gpu = gpu.unwrap();
+
+        thread::spawn(move || {
+            let mut batch_id = 0u64;
+            let mut local_gpu_attempts = 0u64;
+
+            while !found.load(Ordering::Relaxed) {
+                // Calculate starting counter for this GPU batch
+                let batch_start_counter = GPU_RANGE_START + (batch_id * gpu_batch_size);
+
+                match gpu.search_vanity_id(&prefix, batch_start_counter, gpu_batch_size) {
+                    Ok(Some((found_counter, key_data))) => {
+                        // GPU found a match!
+                        local_gpu_attempts += found_counter - batch_start_counter + 1;
+
+                        if !found.swap(true, Ordering::Relaxed) {
+                            *result.lock().unwrap() = Some((
+                                hash_to_extension_id(&Sha256::digest(&key_data)),
+                                key_data,
+                                local_gpu_attempts,
+                                "CUDA GPU".to_string(),
+                            ));
+                        }
+                        break;
+                    }
+                    Ok(None) => {
+                        // No match in this batch, continue
+                        local_gpu_attempts += gpu_batch_size;
+                        batch_id += 1;
+
+                        // Update shared GPU attempts counter
+                        *gpu_attempts.lock().unwrap() = local_gpu_attempts;
+                    }
+                    Err(e) => {
+                        eprintln!("CUDA GPU error: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // Final update
+            *gpu_attempts.lock().unwrap() = local_gpu_attempts;
+        })
+    };
+
+    // Spawn CPU threads (same as Metal hybrid implementation)
+    let cpu_handles: Vec<_> = (0..num_cpu_threads)
+        .map(|thread_id| {
+            let prefix = desired_prefix.to_string();
+            let found = Arc::clone(&found);
+            let result = Arc::clone(&result);
+            let start_time = start_time.clone();
+            let last_progress_time = Arc::clone(&last_progress_time);
+            let cpu_attempts = Arc::clone(&cpu_attempts);
+            let gpu_attempts = Arc::clone(&gpu_attempts);
+
+            thread::spawn(move || {
+                // Each CPU thread gets a range in the second half of counter space
+                let thread_start_counter =
+                    CPU_RANGE_START + ((thread_id as u64) * CPU_THREAD_RANGE_SIZE);
+                let mut local_counter = thread_start_counter;
+                let mut local_attempts = 0u64;
+                const PROGRESS_REPORT_INTERVAL: u64 = 500000; // Report progress every 500k attempts in hybrid mode
+
+                while !found.load(Ordering::Relaxed) {
+                    if let Some((ext_id, key_data)) =
+                        try_generate_match_optimized(&prefix, local_counter)
+                    {
+                        if !found.swap(true, Ordering::Relaxed) {
+                            *result.lock().unwrap() = Some((
+                                ext_id,
+                                key_data,
+                                local_attempts + 1,
+                                format!("CPU-{}", thread_id),
+                            ));
+                        }
+                        break;
+                    }
+
+                    local_counter += 1;
+                    local_attempts += 1;
+
+                    // Periodically update shared progress and print status (only thread 0)
+                    if local_attempts % PROGRESS_REPORT_INTERVAL == 0 {
+                        // Update this CPU thread's attempt count
+                        {
+                            let mut attempts = cpu_attempts.lock().unwrap();
+                            attempts[thread_id] = local_attempts;
+                        }
+
+                        // Only CPU thread 0 prints progress every second
+                        if thread_id == 0 {
+                            let now = Instant::now();
+                            let mut last_time = last_progress_time.lock().unwrap();
+                            if now.duration_since(*last_time).as_secs() >= 1 {
+                                *last_time = now;
+
+                                // Calculate total attempts across GPU and all CPU threads
+                                let gpu_total = *gpu_attempts.lock().unwrap();
+                                let cpu_total = {
+                                    let attempts = cpu_attempts.lock().unwrap();
+                                    attempts.iter().sum::<u64>()
+                                };
+                                let total = gpu_total + cpu_total;
+
+                                let elapsed = start_time.elapsed().as_secs_f64();
+                                if elapsed > 0.0 {
+                                    let rate = total as f64 / elapsed;
+                                    println!(
+                                        "Progress: {} attempts (CUDA GPU: {}, CPU: {}), {} keys/sec",
+                                        total.to_formatted_string(&Locale::en),
+                                        gpu_total.to_formatted_string(&Locale::en),
+                                        cpu_total.to_formatted_string(&Locale::en),
+                                        (rate as u64).to_formatted_string(&Locale::en)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Final update of this CPU thread's attempts
+                {
+                    let mut attempts = cpu_attempts.lock().unwrap();
+                    attempts[thread_id] = local_attempts;
+                }
+            })
+        })
+        .collect();
+
+    // Wait for completion (either GPU or CPU finds a match)
+    gpu_handle.join().unwrap();
+    for handle in cpu_handles {
+        handle.join().unwrap();
+    }
+
+    // Output results
+    let result_data = result.lock().unwrap().take();
+    if let Some((ext_id, key_data, _winning_attempts, winner)) = result_data {
+        let duration = start_time.elapsed().as_secs_f64();
+
+        // Calculate total attempts across GPU and all CPU threads
+        let gpu_total = *gpu_attempts.lock().unwrap();
+        let cpu_total = {
+            let attempts = cpu_attempts.lock().unwrap();
+            attempts.iter().sum::<u64>()
+        };
+        let total = gpu_total + cpu_total;
+
+        let rate = total as f64 / duration;
+
+        println!("\n🎉 Match found by {}!", winner);
+        println!("Extension ID: {}", ext_id);
+        println!(
+            "Total attempts: {} (CUDA GPU: {}, CPU: {})",
+            total.to_formatted_string(&Locale::en),
+            gpu_total.to_formatted_string(&Locale::en),
+            cpu_total.to_formatted_string(&Locale::en)
+        );
+        println!("Duration: {:.2} seconds", duration);
+        println!(
+            "Rate: {} keys/second",
+            (rate as u64).to_formatted_string(&Locale::en)
+        );
+
+        // Save files
+        save_key_files(&key_data);
+
+        // Print base64 for manifest
+        let base64_key = base64::engine::general_purpose::STANDARD.encode(&key_data);
+        println!("\nPublic key for manifest.json:");
+        println!("{}", base64_key);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn run_cuda_vanity_id_generator(desired_prefix: &str, batch_size: u64) {
+    let start_time = Instant::now();
+    let mut total_attempts = 0u64;
+    let mut last_progress_time = Instant::now();
+
+    // Initialize CUDA GPU
+    let gpu = match CudaVanityGenerator::new() {
+        Ok(gpu) => {
+            println!("CUDA GPU Device: {}", gpu.get_device_name());
+            println!("Max threads per block: {}", gpu.get_max_threads_per_block());
+            println!(
+                "Batch size: {}",
+                batch_size.to_formatted_string(&Locale::en)
+            );
+            gpu
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize CUDA GPU: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Use independent counter ranges like CPU implementation
+    // Each batch gets a unique range to avoid overlap with other potential GPU instances
+    let mut batch_id = 0u64;
+
+    loop {
+        // Calculate starting counter for this batch using independent ranges
+        let batch_start_counter = batch_id * batch_size;
+
+        match gpu.search_vanity_id(desired_prefix, batch_start_counter, batch_size) {
+            Ok(Some((found_counter, key_data))) => {
+                // Found a match!
+                total_attempts += found_counter - batch_start_counter + 1;
+
+                let duration = start_time.elapsed().as_secs_f64();
+                let rate = total_attempts as f64 / duration;
+
+                // Generate extension ID for display
+                let hash = Sha256::digest(&key_data);
+                let extension_id = hash_to_extension_id(&hash);
+
+                println!("\n🎉 Match found!");
+                println!("Extension ID: {}", extension_id);
+                println!(
+                    "Total attempts: {}",
+                    total_attempts.to_formatted_string(&Locale::en)
+                );
+                println!("Duration: {:.2} seconds", duration);
+                println!(
+                    "Rate: {} keys/second",
+                    (rate as u64).to_formatted_string(&Locale::en)
+                );
+
+                // Save files
+                save_key_files(&key_data);
+
+                // Print base64 for manifest
+                let base64_key = base64::engine::general_purpose::STANDARD.encode(&key_data);
+                println!("\nPublic key for manifest.json:");
+                println!("{}", base64_key);
                 break;
+            }
+            Ok(None) => {
+                // No match in this batch, continue with next batch
+                total_attempts += batch_size;
+                batch_id += 1;
+
+                // Print progress every second
+                let now = Instant::now();
+                if now.duration_since(last_progress_time).as_secs() >= 1 {
+                    last_progress_time = now;
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    if elapsed > 0.0 {
+                        let rate = total_attempts as f64 / elapsed;
+                        println!(
+                            "Progress: {} attempts, {} keys/sec",
+                            total_attempts.to_formatted_string(&Locale::en),
+                            (rate as u64).to_formatted_string(&Locale::en)
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("CUDA GPU error: {}", e);
+                std::process::exit(1);
             }
         }
     }
